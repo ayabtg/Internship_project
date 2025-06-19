@@ -1,0 +1,440 @@
+rule all:
+    input:
+        "ARI_results.txt",
+        "NMI_results.txt"
+        
+
+
+rule run_pansim: 
+    output:
+        "distances_core_genome.csv"
+    params:
+        core_mutation_rate=0.05,
+        HR_rate=0.05,
+        n_gen=100,
+    threads: 16
+    shell:
+        "/hps/nobackup/jlees/bentaghaline/Pansim/pansim/target/release/pansim --verbose --print_matrices --threads {threads} --core_mu {params.core_mutation_rate} --HR_rate {params.HR_rate} --n_gen {params.n_gen}"
+
+
+
+
+
+rule make_fasta:
+    input:
+        "distances_core_genome.csv"
+    output:  
+        samples_dir=directory("samples"),
+        reference_file="reference_list.txt"
+    threads: 1
+    run:
+        import os
+
+        # Create output directory
+        if not os.path.exists(output.samples_dir):
+            os.mkdir(output.samples_dir)
+        reference_list = []
+
+        # Step 1: Read the matrix from CSV into memory
+        all_sequences = []
+        with open(input[0], "r") as infile:
+            content = infile.read().split("\n")
+        for row in content:
+            if row != "":
+                seq = row.split(",")
+                all_sequences.append(seq)
+
+        # Step 2: Write cleaned FASTA files
+        fasta_content = []
+        for i, row in enumerate(all_sequences):
+            sample_name = f"sample_{i+1}".replace(" ", "")
+            sequence = "".join(row).replace(" ", "").replace("\t", "")
+
+            fasta_path = os.path.join(output.samples_dir, f"{sample_name}.fasta")
+            with open(fasta_path, "w") as o:
+                o.write(f">{sample_name}\n{sequence}\n")
+
+            reference_line = f"{sample_name}\t{output.samples_dir}/{sample_name}.fasta".replace(" ", "")
+            reference_list.append(reference_line)
+
+        # Step 6: Write the reference list
+        with open(output.reference_file, "w") as ref_file:
+            ref_file.write("\n".join(reference_list))
+
+
+rule make_core_and_accessory_fasta:
+    input:
+        "samples"
+    output:
+        samples_dir=directory("samples_full_genome"),
+        reference_file="reference_list_full_genome.txt"
+    run:
+        import csv
+        import random
+        import os
+
+        # Function to generate a random DNA sequence of 1000 base pairs
+        def random_dna(length=1000):
+            return ''.join(random.choices("ACGT", k=length))
+
+        if not os.path.exists(output.samples_dir):
+            os.mkdir(output.samples_dir)
+        # Step 1: Read number of genes (columns)
+        with open("distances_pangenome.csv") as f:
+            reader = csv.reader(f)
+            first_row = next(reader)
+            num_genes = len(first_row)
+
+        # Step 2: Create a random sequence for each accessory gene
+        gene_sequences = {i: random_dna() for i in range(num_genes)}
+
+        # Step 3: Prepare output directory and reference list
+        os.makedirs(output.samples_dir, exist_ok=True)
+        reference_list = []
+
+        # Step 4: Process each sample
+        with open("distances_pangenome.csv") as f:
+            reader = csv.reader(f)
+
+            for sample_index, row in enumerate(reader):
+                sample_number = sample_index + 1
+                sample_name = f"sample_{sample_number}"
+                core_path = os.path.join(input[0], f"{sample_name}.fasta")
+
+                # Read core genome
+                with open(core_path) as core_file:
+                    lines = core_file.read().split("\n")
+                    core_seq = "".join(line.strip() for line in lines if not line.startswith(">"))
+
+                # Add accessory genes
+                full_genome = core_seq
+                for i, value in enumerate(row):
+                    if value == "1":
+                        full_genome += gene_sequences[i]
+
+                # Save full genome
+                output_path = os.path.join(output.samples_dir, f"{sample_name}_full_genome.fasta")
+                with open(output_path, "w") as out:
+                    out.write(f">{sample_name}_full_genome\n")
+                    out.write(full_genome + "\n")
+
+                # Record reference
+                reference_line = f"{sample_name}\t{output.samples_dir}/{sample_name}_full_genome.fasta".replace(" ", "")
+                reference_list.append(reference_line)
+
+        # Step 5: Write the reference list
+        with open(output.reference_file, "w") as ref_file:
+            ref_file.write("\n".join(reference_list))
+
+
+
+
+rule run_poppunk_db:
+    input:
+        "reference_list_full_genome.txt"
+    output:
+        directory("strain_db")
+    threads: 16
+    benchmark: "Benchmarks/run_poppunk_db.txt"
+    shell:
+        "poppunk --create-db --r-files {input} --output strain_db --threads {threads} --plot-fit 5"
+
+
+rule fit_model_bgmm:
+    input:
+        "strain_db"
+    output:
+        directory("strain_db_bgmm")
+    threads: 16
+    benchmark: "Benchmarks/fit_model_bgmm.txt"
+    shell:
+        "poppunk --fit-model bgmm --distances strain_db/strain_db.dists --output strain_db_bgmm --threads {threads} --ref-db strain_db --K 4"
+
+
+
+rule generate_microreact_viz:
+    input:
+        "strain_db_bgmm"
+    output:
+        directory("microreact_viz")
+    threads: 1
+    shell:
+        "poppunk_visualise --ref-db strain_db --previous-clustering strain_db_bgmm/strain_db_bgmm_clusters.csv --model-dir strain_db_bgmm --output microreact_viz --microreact"
+        
+
+
+rule join_fasta:
+    input:
+        "samples"
+    output:
+        "one_fasta_file.fasta"
+    threads: 1
+    run:
+        import glob
+        import os
+
+        all_fasta = sorted(glob.glob(os.path.join(input[0], "*.fasta")))
+
+        with open(output[0], "w") as out_fasta:
+            for fasta in all_fasta:
+                with open(fasta, "r") as f:
+                    cleaned_lines = []
+                    for line in f:
+                        line = line.strip()
+                        if line:
+                            cleaned_lines.append(line)
+                    out_fasta.write("\n".join(cleaned_lines) + "\n")
+
+
+    
+rule build_phylogeny_tree: 
+    input:
+        "one_fasta_file.fasta"
+
+    output:
+        "core_genome_phylogeny_tree.nwk"
+    threads: 48
+    shell:
+        "export OMP_NUM_THREADS={threads} && ./FastTreeMP -nt -fastest -mlnni 4 -nosupport {input} > {output}"
+       
+    
+  
+    
+        
+
+rule rooted_tree:
+    input:
+        "core_genome_phylogeny_tree.nwk"
+    output:
+        "core_genome_phylogeny_tree_rooted.nwk"
+    threads: 1
+    run:
+        from ete3 import Tree
+        t = Tree(input[0])
+        t.set_outgroup(t.get_midpoint_outgroup())
+        t.write(outfile=output[0])
+
+
+rule run_fastbaps:
+    input:
+        "one_fasta_file.fasta",
+        "core_genome_phylogeny_tree_rooted.nwk"
+    output:
+        "fastbaps_clusters.csv"
+    benchmark: "Benchmarks/run_fastbaps.txt"
+    threads: 16
+    shell:
+        "run_fastbaps  --phylogeny=core_genome_phylogeny_tree_rooted.nwk -t {threads} -i one_fasta_file.fasta -o fastbaps_clusters.csv "
+
+
+rule compute_core_hamming_distances:
+    input:
+        fasta_dir="samples"
+    output:
+        "core_genome_hamming_distances.csv"
+    threads: 1
+    run:
+        import os
+        import numpy as np
+        import pandas as pd
+        from tqdm import tqdm
+        from Bio import SeqIO
+        from itertools import combinations
+        from scipy.spatial.distance import pdist
+
+        # Folder containing FASTA files
+        fasta_dir = input.fasta_dir
+
+        # Load sequences
+        def load_sequence(path):
+            record = next(SeqIO.parse(path, "fasta"))
+            return str(record.seq)
+
+        # Get and sort .fasta files numerically
+        fasta_files = sorted(
+            [f for f in os.listdir(fasta_dir) if f.endswith(".fasta")],
+            key=lambda x: int(x.replace("sample_", "").replace(".fasta", ""))
+        )
+
+        sample_names = [f.replace(".fasta", "") for f in fasta_files]
+
+        sequences = [
+            load_sequence(os.path.join(fasta_dir, f)) for f in fasta_files
+        ]
+
+        # Convert A,T,G,C,N to integers
+        nucleotide_map = {'A': 0, 'T': 1, 'G': 2, 'C': 3, 'N': 4}
+        sequence_array = np.array([
+            [nucleotide_map.get(base, 4) for base in seq]
+            for seq in sequences
+        ])
+
+        # Vectorised pairwise Hamming distances
+        hamming_distances = pdist(sequence_array, metric="hamming")
+
+        # Convert to long format
+        results = []
+        for (i, j), dist in zip(combinations(range(len(sample_names)), 2), hamming_distances):
+            results.append([sample_names[i], sample_names[j], dist])
+
+        # Save to CSV
+        df = pd.DataFrame(results, columns=["first_sample", "second_sample", "distance"])
+        df.to_csv(output[0], index=False, sep="\t")
+
+        print("Fast vectorised distance matrix saved to", output[0])
+
+
+
+rule run_kmeans:
+    input:
+        "core_genome_hamming_distances.csv"
+    output:
+        "kmeans_results/kmeans_clusters.csv",
+        "kmeans_results/kmeans_plot.png"
+    benchmark: "Benchmarks/run_kmeans.txt"
+    run:
+        import pandas as pd
+        import matplotlib.pyplot as plt
+        from sklearn.cluster import KMeans
+        from sklearn.manifold import MDS
+
+        #Load pairwise distances (space-separated)
+        df = pd.read_csv("core_genome_hamming_distances.csv", sep=r"\s+", engine="python")
+
+        #Get list of unique samples
+        samples = sorted(set(df["first_sample"]) | set(df["second_sample"]))
+
+        #Create square distance matrix
+        dist_matrix = pd.DataFrame(0.0, index=samples, columns=samples)
+        for _, row in df.iterrows():
+            i, j = row["first_sample"], row["second_sample"]
+            dist_matrix.loc[i, j] = dist_matrix.loc[j, i] = row["distance"]
+
+        # Reduce to 2D
+        coords = MDS(dissimilarity='precomputed', random_state=42).fit_transform(dist_matrix)
+
+        # Apply KMeans
+        kmeans = KMeans(n_clusters=4, random_state=42)
+        labels = kmeans.fit_predict(coords)
+
+
+        # Save sample + cluster only
+        df_clusters = pd.DataFrame({"Sample": samples, "Cluster": labels})
+        df_clusters.to_csv("kmeans_results/kmeans_clusters.csv", index=False)
+
+
+        # Plot
+        plt.scatter(coords[:, 0], coords[:, 1], c=labels, cmap="tab10")
+        plt.title("K-means clustering from Hamming distances")
+        plt.xlabel("X")
+        plt.ylabel("Y")
+        plt.savefig("kmeans_results/kmeans_plot.png")
+        plt.show()
+
+
+
+
+
+rule run_ARI:
+    input:
+        kmeans="kmeans_results/kmeans_clusters.csv",
+        fastbaps="fastbaps_clusters.csv",
+        poppunk="strain_db_bgmm"
+    output:
+        "ARI_results.txt"
+    run:
+        import pandas as pd
+        from sklearn.metrics import adjusted_rand_score
+        from sklearn.metrics import adjusted_rand_score, normalized_mutual_info_score
+
+        #Load and standardize KMeans output
+        kmeans = pd.read_csv("kmeans_results/kmeans_clusters.csv")
+        kmeans = kmeans.rename(columns={"Cluster": "KMeans", "sample": "Sample"})  
+
+        #Load and standardize FastBAPS output (use Level 2)
+        fastbaps = pd.read_csv("fastbaps_clusters.csv")
+        fastbaps = fastbaps.rename(columns={"Isolates": "Sample", "Level 2": "FastBAPS"})
+        fastbaps = fastbaps[["Sample", "FastBAPS"]]
+
+        #Load and standardize PopPUNK output
+        poppunk = pd.read_csv("strain_db_bgmm/strain_db_bgmm_clusters.csv")
+        poppunk = poppunk.rename(columns={"Taxon": "Sample", "Cluster": "PopPUNK"})
+
+
+        #Check column names (debug)
+        print("KMeans columns:", kmeans.columns.tolist())
+        print("FastBAPS columns:", fastbaps.columns.tolist())
+        print("PopPUNK columns:", poppunk.columns.tolist())
+
+        #Merge all on 'Sample'
+        df = kmeans.merge(fastbaps, on="Sample").merge(poppunk, on="Sample")
+
+        # Define cluster pairs to compare
+        pairs = [("KMeans", "FastBAPS"), ("KMeans", "PopPUNK"), ("FastBAPS", "PopPUNK")]
+
+
+        # Write evaluation to file
+        with open("ARI_results.txt", "w") as f:
+            f.write("Adjusted Rand Index (ARI) comparisons:\n")
+            for a, b in pairs:
+                ari = adjusted_rand_score(df[a], df[b])
+                f.write(f"{a} vs {b} → ARI: {ari:.3f}\n")
+        print("\nResults saved to ARI_results.txt")
+
+
+
+
+rule run_NMI:
+    input:
+        kmeans="kmeans_results/kmeans_clusters.csv",
+        fastbaps="fastbaps_clusters.csv",
+        poppunk="strain_db_bgmm"
+    output:
+        "NMI_results.txt"
+    run:
+        import pandas as pd
+        from sklearn.metrics import adjusted_rand_score
+        from sklearn.metrics import adjusted_rand_score, normalized_mutual_info_score
+
+        #Load and standardize KMeans output
+        kmeans = pd.read_csv("kmeans_results/kmeans_clusters.csv")
+        kmeans = kmeans.rename(columns={"Cluster": "KMeans", "sample": "Sample"})  
+
+        #Load and standardize FastBAPS output (use Level 2)
+        fastbaps = pd.read_csv("fastbaps_clusters.csv")
+        fastbaps = fastbaps.rename(columns={"Isolates": "Sample", "Level 2": "FastBAPS"})
+        fastbaps = fastbaps[["Sample", "FastBAPS"]]
+
+        #Load and standardize PopPUNK output
+        poppunk = pd.read_csv("strain_db_bgmm/strain_db_bgmm_clusters.csv")
+        poppunk = poppunk.rename(columns={"Taxon": "Sample", "Cluster": "PopPUNK"})
+
+
+        #Check column names (debug)
+        print("KMeans columns:", kmeans.columns.tolist())
+        print("FastBAPS columns:", fastbaps.columns.tolist())
+        print("PopPUNK columns:", poppunk.columns.tolist())
+
+        #Merge all on 'Sample'
+        df = kmeans.merge(fastbaps, on="Sample").merge(poppunk, on="Sample")
+
+
+        # Define cluster pairs to compare
+        pairs = [("KMeans", "FastBAPS"), ("KMeans", "PopPUNK"), ("FastBAPS", "PopPUNK")]
+
+
+        # Write evaluation to file
+        with open("NMI_results.txt", "w") as f:
+            f.write("\nNormalized Mutual Information (NMI) comparisons:\n")
+            for a, b in pairs:
+                nmi = normalized_mutual_info_score(df[a], df[b])
+                f.write(f"{a} vs {b} → NMI: {nmi:.3f}\n")
+        print("\nResults saved to NMI_results.txt")
+
+
+
+
+
+
+
+       
